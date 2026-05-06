@@ -41,12 +41,12 @@ void        wr_train(const char *text, enum room_id room);
 enum room_id wr_classify(const char *text, float *confidence);
 void        wr_stats(void);         /* print to stdout */
 
-/* ---- P48 exact classification ---- */
+/* ---- P48 exact classification (scalar, exact integer distance) ---- */
 enum room_id wr_classify_p48(const char *text, int *exact_dist);
 
-/* ---- NEON SIMD dispatch (when compiled for ARM64) ---- */
+/* ---- NEON SIMD batch nearest-neighbor (ARM64 only) ---- */
 #ifdef __aarch64__
 enum room_id wr_classify_p48_neon(const char *text);
 #endif
 
-#endif /* WARP_ROOM_H */
+#endif /* WARP_ROOM_H */ /* WARP_ROOM_H */

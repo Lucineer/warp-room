@@ -229,7 +229,7 @@ enum room_id wr_classify(const char *text, float *confidence) {
     return best;
 }
 
-/* ---- P48 exact classification ---- */
+/* ---- P48 exact classification (scalar) ---- */
 enum room_id wr_classify_p48(const char *text, int *exact_dist) {
     if (!g_table) return ROOM_EDGE;
 
@@ -260,6 +260,46 @@ enum room_id wr_classify_p48(const char *text, int *exact_dist) {
     if (exact_dist) *exact_dist = best_dist;
     return best;
 }
+
+/* ---- P48 exact classification with NEON batch ---- */
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#include "p48_neon.h"
+
+enum room_id wr_classify_p48_neon(const char *text) {
+    if (!g_table) return ROOM_EDGE;
+
+    float fvec[VOCAB_DIM];
+    text_features(text, fvec);
+
+    float norm = 0.0f;
+    for (int i = 0; i < VOCAB_DIM; i++) norm += fvec[i] * fvec[i];
+    if (norm < 1e-8f) return ROOM_EDGE;
+    norm = sqrtf(norm);
+    for (int i = 0; i < VOCAB_DIM; i++) fvec[i] /= norm;
+
+    /* Quantize query to P48 */
+    uint64_t qvec_packed[P48_DIMS] = {0};
+    for (int i = 0; i < VOCAB_DIM; i++)
+        float_to_p48_component(fvec[i], i, qvec_packed);
+
+    /* Pre-unpack query to bytes */
+    uint8_t query_bytes[P48_DIMS * 8];
+    p48_unpack_bytes(qvec_packed, query_bytes, P48_DIMS);
+
+    /* Pre-unpack all room vectors to bytes (cache: compute once per classify) */
+    uint8_t room_bytes[NUM_ROOMS * P48_DIMS * 8];
+    for (int ri = 0; ri < NUM_ROOMS; ri++) {
+        p48_unpack_bytes(g_table->rooms[ri].vector,
+                         room_bytes + ri * P48_DIMS * 8, P48_DIMS);
+    }
+
+    /* NEON batch NN */
+    int best = p48_neon_batch_nn(query_bytes, room_bytes,
+                                  NUM_ROOMS, P48_DIMS * 8);
+    return (enum room_id)best;
+}
+#endif
 
 /* ---- init: create or open shared memory ---- */
 void wr_init(void) {
@@ -338,11 +378,27 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
     wr_init();
 
-    if (argc >= 3 && strcmp(argv[1], "--infer") == 0) {
+    if (argc >= 3 && strcmp(argv[1], "--neon-gpu") == 0) {
+        /* Shell out to nvidia-smi for GPU telemetry — like rightnow-cli */
+        FILE *fp = popen("nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1", "r");
+        if (!fp) { printf("{\"error\": \"nvidia-smi failed\"}\n"); return 1; }
+        char buf[256];
+        if (!fgets(buf, sizeof(buf), fp)) { buf[0] = 0; }
+        pclose(fp);
+        printf("%s", buf);
+    } else if (argc >= 3 && strcmp(argv[1], "--infer") == 0) {
         float conf = 0.0f;
         enum room_id r = wr_classify(argv[2], &conf);
         printf("{\"room\": \"%s\", \"confidence\": %.4f}\n",
                g_table ? g_table->rooms[r].name : "unknown", conf);
+    } else if (argc >= 3 && strcmp(argv[1], "--infer-neon") == 0) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+        enum room_id r = wr_classify_p48_neon(argv[2]);
+        printf("{\"room\": \"%s\", \"method\": \"neon\"}\n",
+               g_table ? g_table->rooms[r].name : "unknown");
+#else
+        printf("{\"error\": \"NEON not available\"}\n");
+#endif
     } else if (argc >= 3 && strcmp(argv[1], "--infer-p48") == 0) {
         int dist;
         enum room_id r = wr_classify_p48(argv[2], &dist);
@@ -357,8 +413,10 @@ int main(int argc, char **argv) {
         printf("trained on room %s\n", argv[3]);
     } else {
         printf("Usage:\n");
-        printf("  warp-room --infer <text>     (float cosine similarity)\n");
-        printf("  warp-room --infer-p48 <text> (P48 exact integer distance)\n");
+        printf("  warp-room --infer <text>       (float cosine similarity)\n");
+        printf("  warp-room --infer-p48 <text>   (P48 exact integer distance)\n");
+        printf("  warp-room --infer-neon <text>  (NEON P48 batch NN)\n");
+        printf("  warp-room --neon-gpu <text>    (NEON + GPU telemetry)\n");
         printf("  warp-room --train <text> <room>\n");
     }
     return 0;
